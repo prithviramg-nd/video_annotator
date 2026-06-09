@@ -1,0 +1,7 @@
+pymongo
+loguru
+Pillow
+pandas
+numpy
+p_tqdm
+tqdm
