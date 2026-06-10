@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# video_annotator temp directory (frames, downloads, logs)
+temp/
+
+# Database credentials (keep outside the repo)
+credentials.json

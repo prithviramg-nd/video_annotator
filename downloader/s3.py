@@ -36,8 +36,9 @@ class S3Handler:
             logger.warning(f"S3 access error checking {s3_path}: {e}")
             return False
 
-    def download_file(self, s3_path: str, local_path: str) -> bool:
+    def download_file(self, s3_path: str, local_path: str, alert_id: int = None) -> bool:
         """Download a file from S3 using `aws s3 cp`."""
+        tag = f"[{alert_id}] " if alert_id else ""
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         try:
             result = subprocess.run(
@@ -45,20 +46,21 @@ class S3Handler:
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode == 0:
-                logger.info(f"Downloaded {s3_path} -> {local_path}")
+                logger.info(f"{tag}Downloaded {s3_path} -> {local_path}")
                 return True
             else:
-                logger.error(f"Download failed for {s3_path}: {result.stderr.strip()}")
+                logger.error(f"{tag}Download failed for {s3_path}: {result.stderr.strip()}")
                 return False
         except subprocess.TimeoutExpired:
-            logger.error(f"Download timed out for {s3_path}")
+            logger.error(f"{tag}Download timed out for {s3_path}")
             return False
         except Exception as e:
-            logger.error(f"Download failed for {s3_path}: {e}")
+            logger.error(f"{tag}Download failed for {s3_path}: {e}")
             return False
 
-    def upload_file(self, local_path: str, s3_path: str) -> bool:
+    def upload_file(self, local_path: str, s3_path: str, alert_id: int = None) -> bool:
         """Upload a local file to S3 using `aws s3 cp`."""
+        tag = f"[{alert_id}] " if alert_id else ""
         try:
             result = subprocess.run(
                 [
@@ -69,20 +71,28 @@ class S3Handler:
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode == 0:
-                logger.info(f"Uploaded {local_path} -> {s3_path}")
+                logger.info(f"{tag}Uploaded {local_path} -> {s3_path}")
                 return True
             else:
-                logger.error(f"Upload failed for {s3_path}: {result.stderr.strip()}")
+                logger.error(f"{tag}Upload failed for {s3_path}: {result.stderr.strip()}")
                 return False
         except subprocess.TimeoutExpired:
-            logger.error(f"Upload timed out for {s3_path}")
+            logger.error(f"{tag}Upload timed out for {s3_path}")
             return False
         except Exception as e:
-            logger.error(f"Upload failed for {s3_path}: {e}")
+            logger.error(f"{tag}Upload failed for {s3_path}: {e}")
             return False
 
+    # Buckets to try: the original bucket from the HTTP URL, plus common
+    # alternates (protected ↔ non-protected).
+    _BUCKET_ALTERNATES = {
+        "fleetdata-protected-production": "fleetdata-production",
+        "fleetdata-production": "fleetdata-protected-production",
+    }
+
     def resolve_video_path(
-        self, video_s3_path: str, video_http_path: str = None
+        self, video_s3_path: str, video_http_path: str = None,
+        alert_id: int = None,
     ) -> Tuple[Optional[str], float]:
         """
         Resolve the actual video location on S3 using multiple strategies.
@@ -91,10 +101,11 @@ class S3Handler:
         8/inputVideo.mp4 directly.
 
         For alert source: video_http_path may point to trimmedVideos or
-        outputVideo.mp4. We try:
+        outputVideo.mp4. We try (in both original and alternate buckets):
           1. {session_key}8/inputVideo.mp4
           2. {session_key}8/trimmedVideos/alert/{trim_folder}/inputVideo.mp4
           3. {session_key}inputVideo.mp4
+          4. {session_key}8/previewVideos/alerts/{alert_id}/inputVideo.mp4
 
         Returns (s3_path, trim_start_ms).
         trim_start_ms is non-zero only for trimmed videos.
@@ -128,30 +139,53 @@ class S3Handler:
             else:
                 session_key = key[: key.rfind("/") + 1]
 
+        # Build list of buckets to try: original first, then alternate
+        buckets = [bucket]
+        alt_bucket = self._BUCKET_ALTERNATES.get(bucket)
+        if alt_bucket:
+            buckets.append(alt_bucket)
+
+        # Try each strategy across ALL buckets before moving to the next
+        # strategy.  This avoids picking a weaker match (e.g. root-level
+        # inputVideo.mp4 in a protected bucket) over a stronger match
+        # (8/inputVideo.mp4 in the alternate bucket).
+
         # Strategy 1: /8/inputVideo.mp4
-        s3_try = f"s3://{bucket}/{session_key}8/inputVideo.mp4"
-        if self.s3_object_exists(s3_try):
-            logger.info(f"Strategy 1 (8/inputVideo.mp4): {s3_try}")
-            return s3_try, 0.0
+        for try_bucket in buckets:
+            s3_try = f"s3://{try_bucket}/{session_key}8/inputVideo.mp4"
+            if self.s3_object_exists(s3_try):
+                logger.info(f"Strategy 1 (8/inputVideo.mp4): {s3_try}")
+                return s3_try, 0.0
 
         # Strategy 2: trimmedVideos
         if trim_folder:
-            s3_try = f"s3://{bucket}/{session_key}8/trimmedVideos/alert/{trim_folder}/inputVideo.mp4"
-            if self.s3_object_exists(s3_try):
-                parts = trim_folder.split("_")
-                trim_start_frame = int(parts[1]) if len(parts) > 1 else 0
-                trim_start_ms = trim_start_frame / TRIM_VIDEO_FPS * 1000
-                logger.info(
-                    f"Strategy 2 (trimmedVideos/{trim_folder}): {s3_try} "
-                    f"trim_start_ms={trim_start_ms:.0f}"
-                )
-                return s3_try, trim_start_ms
+            for try_bucket in buckets:
+                s3_try = f"s3://{try_bucket}/{session_key}8/trimmedVideos/alert/{trim_folder}/inputVideo.mp4"
+                if self.s3_object_exists(s3_try):
+                    parts = trim_folder.split("_")
+                    trim_start_frame = int(parts[1]) if len(parts) > 1 else 0
+                    trim_start_ms = trim_start_frame / TRIM_VIDEO_FPS * 1000
+                    logger.info(
+                        f"Strategy 2 (trimmedVideos/{trim_folder}): {s3_try} "
+                        f"trim_start_ms={trim_start_ms:.0f}"
+                    )
+                    return s3_try, trim_start_ms
 
         # Strategy 3: root-level inputVideo.mp4
-        s3_try = f"s3://{bucket}/{session_key}inputVideo.mp4"
-        if self.s3_object_exists(s3_try):
-            logger.info(f"Strategy 3 (root inputVideo.mp4): {s3_try}")
-            return s3_try, 0.0
+        for try_bucket in buckets:
+            s3_try = f"s3://{try_bucket}/{session_key}inputVideo.mp4"
+            if self.s3_object_exists(s3_try):
+                logger.info(f"Strategy 3 (root inputVideo.mp4): {s3_try}")
+                return s3_try, 0.0
 
-        logger.error(f"Could not locate video for session {session_key}")
+        # Strategy 4: previewVideos (short clips stored per alert)
+        if alert_id:
+            for try_bucket in buckets:
+                s3_try = f"s3://{try_bucket}/{session_key}8/previewVideos/alerts/{alert_id}/inputVideo.mp4"
+                if self.s3_object_exists(s3_try):
+                    logger.info(f"Strategy 4 (previewVideos): {s3_try}")
+                    return s3_try, 0.0
+
+        tag = f"[{alert_id}] " if alert_id else ""
+        logger.error(f"{tag}Could not locate video for session {session_key}")
         return None, 0.0

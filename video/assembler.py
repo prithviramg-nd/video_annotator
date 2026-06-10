@@ -22,6 +22,7 @@ class VideoAssembler:
         frames_dir: str,
         output_path: str,
         pattern: str = "%06d.jpg",
+        alert_id: int = None,
     ) -> str:
         """
         Create an MP4 video from sequentially numbered frame images.
@@ -30,10 +31,12 @@ class VideoAssembler:
             frames_dir: directory containing the frame images
             output_path: where to write the output MP4
             pattern: ffmpeg pattern for frame filenames
+            alert_id: optional alert ID for log context
 
         Returns:
             Path to the assembled video.
         """
+        tag = f"[{alert_id}] " if alert_id else ""
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         cmd = [
@@ -46,8 +49,8 @@ class VideoAssembler:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            logger.error(f"Video assembly failed: {result.stderr[-500:]}")
+            logger.error(f"{tag}Video assembly failed: {result.stderr[-500:]}")
             raise RuntimeError(f"ffmpeg exited with code {result.returncode}")
 
-        logger.info(f"Assembled video: {output_path}")
+        logger.info(f"{tag}Assembled video: {output_path}")
         return output_path

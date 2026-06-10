@@ -37,7 +37,7 @@ from loguru import logger
 from PIL import Image, ImageDraw
 
 from .annotators.registry import AnnotatorRegistry
-from .config import FPS, TEMP_DIR, VIDEO_OFFSET_MS
+from .config import FPS, LOG_FILE, TEMP_DIR, VIDEO_OFFSET_MS, load_credentials
 from .data_sources.base import AlertData
 from .data_sources.mongodb import MongoDBSource
 from .downloader.s3 import S3Handler
@@ -101,6 +101,7 @@ def process_alert(
     video_s3, trim_start_ms = s3_handler.resolve_video_path(
         alert_data.video_s3_path,
         alert_data.video_http_path,
+        alert_id=alert_id,
     )
     if video_s3 is None:
         logger.error(f"[{alert_id}] Could not locate video on S3")
@@ -108,7 +109,7 @@ def process_alert(
         return False
 
     local_video = os.path.join(work_dir, "inputVideo.mp4")
-    if not s3_handler.download_file(video_s3, local_video):
+    if not s3_handler.download_file(video_s3, local_video, alert_id=alert_id):
         logger.error(f"[{alert_id}] Video download failed")
         _cleanup(work_dir)
         return False
@@ -120,7 +121,7 @@ def process_alert(
         return False
 
     local_metadata = os.path.join(work_dir, "metadata.txt")
-    if not s3_handler.download_file(alert_data.metadata_s3_path, local_metadata):
+    if not s3_handler.download_file(alert_data.metadata_s3_path, local_metadata, alert_id=alert_id):
         logger.error(f"[{alert_id}] Metadata download failed")
         _cleanup(work_dir)
         return False
@@ -128,7 +129,7 @@ def process_alert(
     # ── 3. Parse metadata ────────────────────────────────────────────────────
     try:
         parser = MetadataParser(local_metadata)
-        detections = parser.get_detections()
+        detections = parser.get_detections(alert_id=alert_id)
         if not detections:
             logger.error(f"[{alert_id}] No detections found in metadata")
             _cleanup(work_dir)
@@ -140,7 +141,7 @@ def process_alert(
 
     # Find event timing
     event_code = alert_data.event_code
-    event = parser.get_event_by_code(event_code)
+    event = parser.get_event_by_code(event_code, alert_id=alert_id)
 
     # Determine start/end offsets
     if event is not None:
@@ -165,15 +166,47 @@ def process_alert(
             f"[{alert_id}] No event timing found, using full video"
         )
 
-    # ── 4. Extract frames ────────────────────────────────────────────────────
+    # ── 4. Extract frames (segment around event) ───────────────────────────
+    # Only extract video_offset_ms before and after the event to reduce
+    # output size (e.g. video_offset_ms(5s) + event_duration + video_offset_ms(5s) instead of full 1min).
     frames_dir = os.path.join(work_dir, "frames")
     try:
         extractor = FrameExtractor(fps=fps)
-        frame_files = extractor.extract_full(local_video, frames_dir)
+
+        # Calculate segment boundaries in the video's own timeline
+        adj_event_start = max(0, start_offset_ms - trim_start_ms)
+        adj_event_end = end_offset_ms - trim_start_ms
+
+        video_duration_ms = FrameExtractor.get_video_duration_ms(local_video)
+
+        segment_start_ms = max(0, adj_event_start - video_offset_ms)
+        segment_end_ms = min(video_duration_ms, adj_event_end + video_offset_ms)
+        segment_duration_ms = segment_end_ms - segment_start_ms
+
+        logger.info(
+            f"[{alert_id}] Extracting segment: "
+            f"{segment_start_ms:.0f}ms - {segment_end_ms:.0f}ms "
+            f"(duration: {segment_duration_ms:.0f}ms, "
+            f"event: {adj_event_start}ms - {adj_event_end}ms, "
+            f"padding: {video_offset_ms}ms)"
+        )
+
+        frame_files = extractor.extract_segment(
+            local_video, frames_dir,
+            start_ms=segment_start_ms,
+            duration_ms=segment_duration_ms,
+            alert_id=alert_id,
+        )
         if not frame_files:
             logger.error(f"[{alert_id}] No frames extracted")
             _cleanup(work_dir)
             return False
+
+        # Slice detections to match the extracted segment
+        seg_start_frame = int(segment_start_ms * fps / 1000)
+        seg_end_frame = int(segment_end_ms * fps / 1000)
+        detections = detections[seg_start_frame:seg_end_frame]
+
     except Exception as e:
         logger.error(f"[{alert_id}] Frame extraction failed: {e}")
         _cleanup(work_dir)
@@ -187,13 +220,9 @@ def process_alert(
         _cleanup(work_dir)
         return False
 
-    # Calculate event frame indices (relative to extracted frames)
-    # Adjust for trim offset if needed
-    adj_start = max(0, start_offset_ms - trim_start_ms)
-    adj_end = end_offset_ms - trim_start_ms
-
-    event_start_frame = int(adj_start * fps / 1000)
-    event_end_frame = int(adj_end * fps / 1000)
+    # Calculate event frame indices relative to the extracted segment
+    event_start_frame = int((adj_event_start - segment_start_ms) * fps / 1000)
+    event_end_frame = int((adj_event_end - segment_start_ms) * fps / 1000)
 
     num_frames = min(len(frame_files), len(detections))
     logger.info(
@@ -224,11 +253,11 @@ def process_alert(
             logger.error(f"[{alert_id}] Error annotating frame {idx}: {e}")
 
     # ── 6. Assemble video ────────────────────────────────────────────────────
-    video_name = f"{alert_id}_{start_offset_ms}_{end_offset_ms}.mp4"
+    video_name = f"{alert_id}_{event_code}_{event_start_frame}_{event_end_frame}.mp4"
     output_video = os.path.join(output_dir, video_name)
     try:
         assembler = VideoAssembler(fps=fps)
-        assembler.assemble(frames_dir, output_video)
+        assembler.assemble(frames_dir, output_video, alert_id=alert_id)
     except Exception as e:
         logger.error(f"[{alert_id}] Video assembly failed: {e}")
         _cleanup(work_dir)
@@ -239,7 +268,7 @@ def process_alert(
     # ── 7. Upload to S3 ─────────────────────────────────────────────────────
     if s3_upload_path:
         s3_dest = f"{s3_upload_path.rstrip('/')}/{video_name}"
-        if s3_handler.upload_file(output_video, s3_dest):
+        if s3_handler.upload_file(output_video, s3_dest, alert_id=alert_id):
             logger.info(f"[{alert_id}] Uploaded to {s3_dest}")
             # Remove local copy after successful upload
             try:
@@ -387,8 +416,8 @@ Examples:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=os.path.join(os.getcwd(), "annotated_videos"),
-        help="Local directory for output videos (default: ./annotated_videos)",
+        default=os.path.join(TEMP_DIR, "annotated_videos"),
+        help="Local directory for output videos (default: temp/annotated_videos)",
     )
     parser.add_argument(
         "--s3-upload",
@@ -427,6 +456,16 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--credentials-file",
+        type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "my_creds.json"),
+        help=(
+            "Path to JSON file with database credentials "
+            "(must contain 'mongo_uri'). If not provided, you will be "
+            "prompted to enter the path interactively."
+        ),
+    )
 
     return parser
 
@@ -452,8 +491,24 @@ def main():
     logger.remove()
     log_level = "DEBUG" if args.verbose else "INFO"
     logger.add(sys.stderr, level=log_level)
-    if args.log_file:
-        logger.add(args.log_file, rotation="10 MB", level="DEBUG", mode="w")
+
+    # Always log to temp/video_annotator.log
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    log_dest = args.log_file or LOG_FILE
+    logger.add(log_dest, level="DEBUG", mode="w")
+    logger.info(f"Log file: {log_dest}")
+
+    # ── Load database credentials ──────────────────────────────────────────
+    creds_path = args.credentials_file
+    if creds_path is None:
+        print("\nEnter path to credentials JSON file")
+        print("  (must contain 'mongo_uri', optionally 'postgres_uri'):")
+        creds_path = input("> ").strip()
+        if not creds_path:
+            logger.error("No credentials file provided")
+            sys.exit(1)
+    credentials = load_credentials(creds_path)
+    logger.info(f"Loaded credentials from: {creds_path}")
 
     # ── S3 upload path ───────────────────────────────────────────────────────
     s3_upload = args.s3_upload
@@ -507,7 +562,7 @@ def main():
 
     # ── Fetch alert data from MongoDB (batch query) ────────────────────────
     logger.info(f"Fetching alert data from MongoDB for {len(alert_ids)} alert(s)...")
-    data_source = MongoDBSource()
+    data_source = MongoDBSource(uri=credentials["mongo_uri"])
     results_map = data_source.fetch_batch(alert_ids)
     data_source.close()
 

@@ -3,25 +3,58 @@ Central configuration for the video_annotator tool.
 All constants and defaults are defined here for easy modification.
 """
 
+import json
 import os
-import tempfile
+import sys
 
-# ── MongoDB ──────────────────────────────────────────────────────────────────
-MONGO_URI = (
-    "mongodb://mongo_dp_ro:vam1aBcp@analytics-dashboard-mongo-db.netradyne.info:27019/"
-    "?readPreference=primary&ssl=false"
-)
+# ── MongoDB (non-secret constants) ──────────────────────────────────────────
 MONGO_DB = "analytics"
 MONGO_COLLECTION_VIDEO_REQUESTS = "video_requests_v2"
 MONGO_COLLECTION_ALERT = "alert"
 
+
+# ── Credentials loader ─────────────────────────────────────────────────────
+def load_credentials(filepath: str) -> dict:
+    """Load database credentials from a JSON file.
+
+    Expected format::
+
+        {
+            "mongo_uri": "mongodb://user:pass@host:port/?...",
+            "postgres_uri": "postgresql://user:pass@host:port/db"  // optional, for future use
+        }
+
+    Returns the parsed dict.  Raises SystemExit on error so callers get a
+    clear message instead of a traceback.
+    """
+    path = os.path.expanduser(filepath)
+    if not os.path.isfile(path):
+        print(f"Error: credentials file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(path) as f:
+            creds = json.load(f)
+    except json.JSONDecodeError as exc:
+        print(f"Error: invalid JSON in credentials file: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if "mongo_uri" not in creds:
+        print(
+            "Error: credentials file must contain a 'mongo_uri' key",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return creds
+
 # ── Video processing ────────────────────────────────────────────────────────
 FPS = 10                       # output video / detection frame rate
-VIDEO_OFFSET_MS = 5000         # padding around event window (ms)
+VIDEO_OFFSET_MS = 5000         # padding around event window (ms) — 5s before + 5s after
 TRIM_VIDEO_FPS = 30            # fps used to interpret trim folder frame numbers
 
 # ── Temporary storage ───────────────────────────────────────────────────────
-TEMP_DIR = os.path.join(tempfile.gettempdir(), "video_annotator_temp")
+# Use a repo-local temp/ directory for all scratch files (frames, downloads,
+# logs).  The directory is .gitignored and cleaned up after each alert.
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+LOG_FILE = os.path.join(TEMP_DIR, "video_annotator.log")
 
 # ── Annotation defaults ─────────────────────────────────────────────────────
 DEFAULT_FONT_SIZE = 24

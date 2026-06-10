@@ -15,9 +15,9 @@ from urllib.parse import urlparse
 
 import pymongo
 from loguru import logger
+from tqdm import tqdm
 
 from ..config import (
-    MONGO_URI,
     MONGO_DB,
     MONGO_COLLECTION_VIDEO_REQUESTS,
     MONGO_COLLECTION_ALERT,
@@ -28,7 +28,7 @@ from .base import AlertData, BaseDataSource
 class MongoDBSource(BaseDataSource):
     """Fetch alert data from MongoDB."""
 
-    def __init__(self, uri: str = MONGO_URI, db_name: str = MONGO_DB):
+    def __init__(self, uri: str, db_name: str = MONGO_DB):
         self._client = pymongo.MongoClient(uri)
         self._db = self._client[db_name]
         self._vr_col = self._db[MONGO_COLLECTION_VIDEO_REQUESTS]
@@ -58,7 +58,7 @@ class MongoDBSource(BaseDataSource):
         # ── Batch query: video_requests_v2 ───────────────────────────────────
         logger.info(f"Querying video_requests_v2 for {len(remaining)} alert(s)...")
         vr_cursor = self._vr_col.find({"alert_id": {"$in": list(remaining)}})
-        for doc in vr_cursor:
+        for doc in tqdm(vr_cursor, total=len(remaining), desc="video_requests_v2"):
             aid = doc.get("alert_id")
             ad = self._parse_video_request_doc(aid, doc)
             if ad is not None:
@@ -70,6 +70,28 @@ class MongoDBSource(BaseDataSource):
             f"{len(remaining)} remaining"
         )
 
+        # ── Backfill offsets from alert collection for video_requests_v2 hits ─
+        # video_requests_v2 doesn't have start/end offsets, so fetch them
+        # from the alert collection for all alerts found so far.
+        vr_ids = [aid for aid, ad in results.items() if ad.source == "video_requests_v2"]
+        if vr_ids:
+            logger.info(f"Backfilling offsets from alert collection for {len(vr_ids)} alert(s)...")
+            offset_cursor = self._alert_col.find(
+                {"alertId": {"$in": vr_ids}},
+                {"alertId": 1, "startOffset": 1, "endOffset": 1},
+            )
+            backfilled = 0
+            for doc in offset_cursor:
+                aid = doc.get("alertId")
+                if aid in results:
+                    so = doc.get("startOffset")
+                    eo = doc.get("endOffset")
+                    if so is not None and eo is not None:
+                        results[aid].start_offset = so
+                        results[aid].end_offset = eo
+                        backfilled += 1
+            logger.info(f"Backfilled offsets for {backfilled}/{len(vr_ids)} alert(s)")
+
         # ── Batch query: alert collection (for remaining) ────────────────────
         if remaining:
             logger.info(f"Querying alert collection for {len(remaining)} alert(s)...")
@@ -77,7 +99,7 @@ class MongoDBSource(BaseDataSource):
                 {"alertId": {"$in": list(remaining)}}
             )
             found_in_alert = 0
-            for doc in alert_cursor:
+            for doc in tqdm(alert_cursor, total=len(remaining), desc="alert collection"):
                 aid = doc.get("alertId")
                 ad = self._parse_alert_doc(aid, doc)
                 if ad is not None:

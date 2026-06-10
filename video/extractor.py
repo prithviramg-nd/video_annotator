@@ -32,11 +32,12 @@ class FrameExtractor:
                 "ffmpeg not found. Install with: brew install ffmpeg"
             )
 
-    def extract_full(self, video_path: str, output_dir: str) -> List[str]:
+    def extract_full(self, video_path: str, output_dir: str, alert_id: int = None) -> List[str]:
         """
         Extract all frames from the entire video at self.fps.
         Returns sorted list of frame file paths.
         """
+        tag = f"[{alert_id}] " if alert_id else ""
         os.makedirs(output_dir, exist_ok=True)
         cmd = [
             "ffmpeg", "-y",
@@ -47,11 +48,11 @@ class FrameExtractor:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            logger.error(f"ffmpeg extraction failed: {result.stderr[-500:]}")
+            logger.error(f"{tag}ffmpeg extraction failed: {result.stderr[-500:]}")
             raise RuntimeError(f"ffmpeg exited with code {result.returncode}")
 
         frames = sorted(glob.glob(os.path.join(output_dir, "*.jpg")))
-        logger.info(f"Extracted {len(frames)} frames from {video_path}")
+        logger.info(f"{tag}Extracted {len(frames)} frames from {video_path}")
         return frames
 
     def extract_segment(
@@ -60,11 +61,13 @@ class FrameExtractor:
         output_dir: str,
         start_ms: float,
         duration_ms: float,
+        alert_id: int = None,
     ) -> List[str]:
         """
         Extract frames from a specific time segment.
         Returns sorted list of frame file paths.
         """
+        tag = f"[{alert_id}] " if alert_id else ""
         os.makedirs(output_dir, exist_ok=True)
         cmd = [
             "ffmpeg", "-y",
@@ -77,12 +80,12 @@ class FrameExtractor:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            logger.error(f"ffmpeg segment extraction failed: {result.stderr[-500:]}")
+            logger.error(f"{tag}ffmpeg segment extraction failed: {result.stderr[-500:]}")
             raise RuntimeError(f"ffmpeg exited with code {result.returncode}")
 
         frames = sorted(glob.glob(os.path.join(output_dir, "*.jpg")))
         logger.info(
-            f"Extracted {len(frames)} frames (segment "
+            f"{tag}Extracted {len(frames)} frames (segment "
             f"{start_ms:.0f}-{start_ms + duration_ms:.0f}ms) from {video_path}"
         )
         return frames
