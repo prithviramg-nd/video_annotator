@@ -46,18 +46,24 @@ class EyeScoresAnnotator(BaseAnnotator):
         le_bbox = detection.get("left_eye_bbox")
         if le_bbox is not None:
             x1, y1, x2, y2 = le_bbox
-            draw.rectangle(
-                [x1, y1, x2, y2],
-                outline=COLORS["left_eye_bbox"],
-                width=1,
-            )
+            x_min, x_max = min(x1, x2), max(x1, x2)
+            y_min, y_max = min(y1, y2), max(y1, y2)
+            if x_max > x_min and y_max > y_min:
+                draw.rectangle(
+                    [x_min, y_min, x_max, y_max],
+                    outline=COLORS["left_eye_bbox"],
+                    width=1,
+                )
 
         # Right eye bbox
         re_bbox = detection.get("right_eye_bbox")
         if re_bbox is not None:
             x1, y1, x2, y2 = re_bbox
-            draw.rectangle(
-                [x1, y1, x2, y2],
-                outline=COLORS["right_eye_bbox"],
-                width=1,
-            )
+            x_min, x_max = min(x1, x2), max(x1, x2)
+            y_min, y_max = min(y1, y2), max(y1, y2)
+            if x_max > x_min and y_max > y_min:
+                draw.rectangle(
+                    [x_min, y_min, x_max, y_max],
+                    outline=COLORS["right_eye_bbox"],
+                    width=1,
+                )

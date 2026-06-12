@@ -3,17 +3,17 @@
 video_annotator - CLI tool for downloading, annotating, and uploading alert videos.
 
 Usage:
-    # Process alert IDs from CSV with specific annotations
-    python -m video_annotator.main --csv alerts.csv --annotate face_bbox nose shoulders
+    # Process alert IDs from CSV (MongoDB lookup)
+    python -m video_annotator.main --alerts --csv alerts.csv --annotate all
 
-    # Process a single alert ID with all annotations
-    python -m video_annotator.main --alert-id 5815863985 --annotate all
+    # Process AVIDs from CSV (AVC API + S3 download)
+    python -m video_annotator.main --avids --csv sample_avids.csv --annotate all
+
+    # Process a single alert ID
+    python -m video_annotator.main --alerts --alert-id 5815863985 --annotate face_bbox nose
 
     # List available annotators
     python -m video_annotator.main --list-annotators
-
-    # Process with only frame_info and event_window (no detection overlays)
-    python -m video_annotator.main --csv alerts.csv --annotate frame_info event_window
 """
 
 # Allow running directly: python main.py --help
@@ -39,6 +39,9 @@ from PIL import Image, ImageDraw
 from .annotators.registry import AnnotatorRegistry
 from .config import FPS, LOG_FILE, TEMP_DIR, VIDEO_OFFSET_MS, load_credentials
 from .data_sources.base import AlertData
+from .data_sources.avid_csv import (
+    AvidData, parse_avid_csv, query_avc_api, download_dms_video,
+)
 from .data_sources.mongodb import MongoDBSource
 from .downloader.s3 import S3Handler
 from .metadata.parser import MetadataParser
@@ -297,6 +300,206 @@ def _cleanup(path: str):
         logger.warning(f"Cleanup failed for {path}: {e}")
 
 
+# ── AVID Pipeline ────────────────────────────────────────────────────────────
+
+def process_avid(
+    avid_data: AvidData,
+    annotator_names: List[str],
+    output_dir: str,
+    s3_upload_path: Optional[str] = None,
+    fps: int = FPS,
+    video_offset_ms: int = VIDEO_OFFSET_MS,
+    env: str = "production",
+) -> bool:
+    """
+    Pipeline for one AVID entry.  Clipping and annotation are independent
+    features toggled by which columns are present in the CSV row:
+
+      should_clip      (start_offset + end_offset present)  ->  clip to event window
+      should_annotate  (json_path present)                  ->  overlay detections
+
+    Four possible combinations:
+      clip + annotate  |  clip only  |  annotate only  |  plain (full video, no overlay)
+
+    Returns True on success.
+    """
+    avid = avid_data.avid
+    s3_handler = _get_s3_handler()
+
+    logger.info(f"{'='*60}")
+    logger.info(f"Processing avid={avid}")
+    logger.info(f"{'='*60}")
+    logger.info(
+        f"[{avid}] clip={avid_data.should_clip}, "
+        f"annotate={avid_data.should_annotate}, "
+        f"event_code={avid_data.event_code or 'N/A'}"
+    )
+
+    work_dir = os.path.join(TEMP_DIR, avid)
+    os.makedirs(work_dir, exist_ok=True)
+
+    # ── 1. Call AVC API to get S3 path ───────────────────────────────────────
+    api_result = query_avc_api(avid, env=env)
+    if api_result is None:
+        logger.error(f"[{avid}] AVC API failed")
+        _cleanup(work_dir)
+        return False
+
+    # ── 2. Download DMS video ────────────────────────────────────────────────
+    local_video = download_dms_video(avid, api_result, work_dir)
+    if local_video is None:
+        logger.error(f"[{avid}] DMS video download failed")
+        _cleanup(work_dir)
+        return False
+
+    # ── 3. Extract frames ────────────────────────────────────────────────────
+    frames_dir = os.path.join(work_dir, "frames")
+    extractor = FrameExtractor(fps=fps)
+
+    try:
+        if avid_data.should_clip:
+            # Clip to event segment with padding
+            video_duration_ms = FrameExtractor.get_video_duration_ms(local_video)
+            segment_start_ms = max(0, avid_data.start_offset - video_offset_ms)
+            segment_end_ms = min(video_duration_ms, avid_data.end_offset + video_offset_ms)
+            segment_duration_ms = segment_end_ms - segment_start_ms
+
+            logger.info(
+                f"[{avid}] Extracting segment: "
+                f"{segment_start_ms:.0f}ms - {segment_end_ms:.0f}ms "
+                f"(duration: {segment_duration_ms:.0f}ms, "
+                f"event: {avid_data.start_offset}ms - {avid_data.end_offset}ms, "
+                f"padding: {video_offset_ms}ms)"
+            )
+            frame_files = extractor.extract_segment(
+                local_video, frames_dir,
+                start_ms=segment_start_ms,
+                duration_ms=segment_duration_ms,
+                alert_id=avid,
+            )
+
+            # Event frame indices relative to the extracted segment
+            event_start_frame = int((avid_data.start_offset - segment_start_ms) * fps / 1000)
+            event_end_frame = int((avid_data.end_offset - segment_start_ms) * fps / 1000)
+        else:
+            # Full video, no clipping
+            logger.info(f"[{avid}] Extracting full video at {fps} FPS")
+            frame_files = extractor.extract_full(
+                local_video, frames_dir, alert_id=avid,
+            )
+            segment_start_ms = 0
+            event_start_frame = 0
+            event_end_frame = len(frame_files) if frame_files else 0
+
+        if not frame_files:
+            logger.error(f"[{avid}] No frames extracted")
+            _cleanup(work_dir)
+            return False
+
+    except Exception as e:
+        logger.error(f"[{avid}] Frame extraction failed: {e}")
+        _cleanup(work_dir)
+        return False
+
+    # ── 4. Annotate frames (if json_path provided) ───────────────────────────
+    if avid_data.should_annotate:
+        json_path = avid_data.json_path
+        if not os.path.isfile(json_path):
+            logger.error(f"[{avid}] summary.json not found: {json_path}")
+            _cleanup(work_dir)
+            return False
+
+        try:
+            parser = MetadataParser(json_path)
+            detections = parser.get_detections(alert_id=avid)
+            if not detections:
+                logger.error(f"[{avid}] No detections found in {json_path}")
+                _cleanup(work_dir)
+                return False
+        except Exception as e:
+            logger.error(f"[{avid}] summary.json parse error: {e}")
+            _cleanup(work_dir)
+            return False
+
+        # Slice detections to match extracted segment when clipped
+        if avid_data.should_clip:
+            seg_start_frame = int(segment_start_ms * fps / 1000)
+            seg_end_frame = int(segment_end_ms * fps / 1000)
+            detections = detections[seg_start_frame:seg_end_frame]
+
+        try:
+            annotators = AnnotatorRegistry.get(annotator_names)
+        except ValueError as e:
+            logger.error(f"[{avid}] {e}")
+            _cleanup(work_dir)
+            return False
+
+        num_frames = min(len(frame_files), len(detections))
+        logger.info(
+            f"[{avid}] Annotating {num_frames} frames "
+            f"(event frames: {event_start_frame}-{event_end_frame}), "
+            f"annotators: {annotator_names}"
+        )
+
+        for idx in range(num_frames):
+            detection = detections[idx]
+            frame_path = frame_files[idx]
+            try:
+                with Image.open(frame_path) as img:
+                    draw = ImageDraw.Draw(img)
+                    for annotator in annotators:
+                        annotator.annotate(
+                            img=img,
+                            draw=draw,
+                            detection=detection,
+                            frame_idx=idx,
+                            total_frames=num_frames,
+                            event_start_frame=event_start_frame,
+                            event_end_frame=event_end_frame,
+                        )
+                    img.save(frame_path)
+            except Exception as e:
+                logger.error(f"[{avid}] Error annotating frame {idx}: {e}")
+
+    # ── 5. Assemble video ────────────────────────────────────────────────────
+    # Build filename: avid[_event_code][_startFrame_endFrame].mp4
+    parts = [avid]
+    if avid_data.has_event_code:
+        parts.append(avid_data.event_code)
+    if avid_data.should_clip:
+        parts.append(f"{event_start_frame}_{event_end_frame}")
+    video_name = "_".join(parts) + ".mp4"
+
+    output_video = os.path.join(output_dir, video_name)
+    try:
+        assembler = VideoAssembler(fps=fps)
+        assembler.assemble(frames_dir, output_video, alert_id=avid)
+    except Exception as e:
+        logger.error(f"[{avid}] Video assembly failed: {e}")
+        _cleanup(work_dir)
+        return False
+
+    label = "Annotated video" if avid_data.should_annotate else "Output video"
+    logger.info(f"[{avid}] {label}: {output_video}")
+
+    # ── 6. Upload to S3 ─────────────────────────────────────────────────────
+    if s3_upload_path:
+        s3_dest = f"{s3_upload_path.rstrip('/')}/{video_name}"
+        if s3_handler.upload_file(output_video, s3_dest, alert_id=avid):
+            logger.info(f"[{avid}] Uploaded to {s3_dest}")
+            try:
+                os.remove(output_video)
+            except OSError as e:
+                logger.warning(f"[{avid}] Could not remove local file: {e}")
+        else:
+            logger.error(f"[{avid}] Upload failed, keeping local file: {output_video}")
+
+    # ── 7. Cleanup ───────────────────────────────────────────────────────────
+    _cleanup(work_dir)
+    logger.info(f"[{avid}] Done")
+    return True
+
+
 # ── S3 credential pre-flight ────────────────────────────────────────────────
 
 def _preflight_s3_check() -> bool:
@@ -365,34 +568,54 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process one alert with face bbox and keypoints
-  python -m video_annotator.main --alert-id 5815863985 --annotate face_bbox nose shoulders
+  # Process alert IDs from CSV (uses MongoDB)
+  python -m video_annotator.main --alerts --csv alerts.csv --annotate all
 
-  # Process alerts from CSV with all annotations
-  python -m video_annotator.main --csv alerts.csv --annotate all
+  # Process a single alert with face bbox and keypoints
+  python -m video_annotator.main --alerts --alert-id 5815863985 --annotate face_bbox nose shoulders
+
+  # Process AVIDs from CSV (uses AVC API + S3, like syncalert.py)
+  python -m video_annotator.main --avids --csv sample_avids.csv --annotate all
 
   # Process and upload to S3
-  python -m video_annotator.main --csv alerts.csv --annotate face_bbox --s3-upload s3://bucket/prefix/
+  python -m video_annotator.main --alerts --csv alerts.csv --annotate face_bbox --s3-upload s3://bucket/prefix/
 
   # Control parallelism
-  python -m video_annotator.main --csv alerts.csv --annotate all --workers 4
+  python -m video_annotator.main --avids --csv sample_avids.csv --annotate all --workers 4
 
   # List available annotation types
   python -m video_annotator.main --list-annotators
 """,
     )
 
-    # Input sources (mutually exclusive)
-    input_group = parser.add_mutually_exclusive_group()
-    input_group.add_argument(
+    # Mode: --alerts or --avids (mutually exclusive, required unless --list-annotators)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--alerts",
+        action="store_true",
+        help="Process alert IDs (uses MongoDB to fetch S3 paths)",
+    )
+    mode_group.add_argument(
+        "--avids",
+        action="store_true",
+        help="Process AVIDs (uses AVC API + S3 to download DMS videos, like syncalert.py)",
+    )
+
+    # Input sources
+    parser.add_argument(
         "--alert-id",
         type=int,
-        help="Single alert ID to process",
+        help="Single alert ID to process (only with --alerts)",
     )
-    input_group.add_argument(
+    parser.add_argument(
         "--csv",
         type=str,
-        help="Path to CSV file containing alert IDs (column: alert_id)",
+        help=(
+            "Path to CSV file. "
+            "With --alerts: must contain 'alert_id' column. "
+            "With --avids: must contain 'avid' column; optional columns: "
+            "event_code, start_offset, end_offset, json_path."
+        ),
     )
 
     # Annotation configuration
@@ -484,8 +707,12 @@ def main():
         sys.exit(0)
 
     # ── Validate input ───────────────────────────────────────────────────────
+    if not args.alerts and not args.avids:
+        parser.error("Specify --alerts or --avids to choose the processing mode")
     if args.alert_id is None and args.csv is None:
         parser.error("Provide either --alert-id or --csv")
+    if args.avids and args.alert_id is not None:
+        parser.error("--alert-id can only be used with --alerts, not --avids")
 
     # ── Configure logging ────────────────────────────────────────────────────
     logger.remove()
@@ -497,31 +724,6 @@ def main():
     log_dest = args.log_file or LOG_FILE
     logger.add(log_dest, level="DEBUG", mode="w")
     logger.info(f"Log file: {log_dest}")
-
-    # ── Load database credentials ──────────────────────────────────────────
-    creds_path = args.credentials_file
-    if creds_path is None:
-        print("\nEnter path to credentials JSON file")
-        print("  (must contain 'mongo_uri', optionally 'postgres_uri'):")
-        creds_path = input("> ").strip()
-        if not creds_path:
-            logger.error("No credentials file provided")
-            sys.exit(1)
-    credentials = load_credentials(creds_path)
-    logger.info(f"Loaded credentials from: {creds_path}")
-
-    # ── S3 upload path ───────────────────────────────────────────────────────
-    s3_upload = args.s3_upload
-    if s3_upload is None:
-        print("\nEnter S3 path for uploading annotated videos")
-        print("  e.g. s3://netradyne-sharing/analytics/prithvi/annotated/")
-        print("  (press Enter to skip S3 upload):")
-        s3_input = input("> ").strip().strip("\r\n\t ")
-        if s3_input:
-            s3_upload = s3_input
-            logger.info(f"S3 upload path: {s3_upload}")
-        else:
-            logger.info("S3 upload skipped (videos saved locally only)")
 
     # ── Pre-flight S3 check ──────────────────────────────────────────────────
     # Validate credentials in main process BEFORE forking workers.
@@ -536,11 +738,98 @@ def main():
     else:
         annotator_names = args.annotate
 
-    # Validate annotator names
+    # Validate annotator names (skip for avid-csv minimal mode,
+    # but validate anyway since some entries may have full info)
     try:
         AnnotatorRegistry.get(annotator_names)
     except ValueError as e:
         parser.error(str(e))
+
+    # ── S3 upload path ───────────────────────────────────────────────────────
+    s3_upload = args.s3_upload
+    if s3_upload is None:
+        print("\nEnter S3 path for uploading annotated videos")
+        print("  e.g. s3://netradyne-sharing/analytics/prithvi/annotated/")
+        print("  (press Enter to skip S3 upload):")
+        s3_input = input("> ").strip().strip("\r\n\t ")
+        if s3_input:
+            s3_upload = s3_input
+            logger.info(f"S3 upload path: {s3_upload}")
+        else:
+            logger.info("S3 upload skipped (videos saved locally only)")
+
+    # ── Setup output dirs ────────────────────────────────────────────────────
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    # ── Branch: AVID vs Alert flow ──────────────────────────────────────────
+    if args.avids:
+        _run_avid_flow(args, annotator_names, s3_upload)
+    else:
+        _run_alert_flow(args, parser, annotator_names, s3_upload)
+
+
+def _run_avid_flow(args, annotator_names, s3_upload):
+    """Process AVIDs from CSV: AVC API -> S3 download -> annotate/convert."""
+    avid_data_list = parse_avid_csv(args.csv)
+    if not avid_data_list:
+        logger.error("No AVID entries found in CSV. Nothing to process.")
+        sys.exit(1)
+
+    total = len(avid_data_list)
+    num_workers = min(args.workers, total)
+
+    logger.info(f"Processing {total} AVID(s) with {num_workers} workers")
+    logger.info(f"Annotators: {annotator_names}")
+    logger.info(f"Output: {args.output_dir}")
+    if s3_upload:
+        logger.info(f"S3 upload: {s3_upload}")
+
+    def _worker(avid_data: AvidData) -> bool:
+        """Worker function for p_tqdm."""
+        try:
+            return process_avid(
+                avid_data=avid_data,
+                annotator_names=annotator_names,
+                output_dir=args.output_dir,
+                s3_upload_path=s3_upload,
+                fps=args.fps,
+                video_offset_ms=args.video_offset,
+            )
+        except Exception as e:
+            logger.error(f"Unhandled error for avid {avid_data.avid}: {e}")
+            return False
+
+    if total == 1:
+        results = [_worker(avid_data_list[0])]
+    else:
+        results = p_tqdm.p_map(
+            _worker,
+            avid_data_list,
+            num_cpus=num_workers,
+            desc="Processing AVIDs",
+        )
+
+    success_count = sum(1 for r in results if r)
+    fail_count = total - success_count
+    logger.info(f"{'='*60}")
+    logger.info(f"Done. Success: {success_count}, Failed: {fail_count}, Total: {total}")
+    logger.info(f"{'='*60}")
+
+
+def _run_alert_flow(args, parser, annotator_names, s3_upload):
+    """Process alert IDs from CSV or --alert-id: MongoDB -> S3 download -> annotate."""
+    # ── Load database credentials ──────────────────────────────────────────
+    creds_path = args.credentials_file
+    if creds_path is None:
+        print("\nEnter path to credentials JSON file")
+        print("  (must contain 'mongo_uri', optionally 'postgres_uri'):")
+        creds_path = input("> ").strip()
+        if not creds_path:
+            logger.error("No credentials file provided")
+            sys.exit(1)
+    credentials = load_credentials(creds_path)
+    logger.info(f"Loaded credentials from: {creds_path}")
 
     # ── Collect alert IDs ────────────────────────────────────────────────────
     if args.alert_id:
@@ -586,10 +875,6 @@ def main():
     if s3_upload:
         logger.info(f"S3 upload: {s3_upload}")
 
-    # ── Setup ────────────────────────────────────────────────────────────────
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(TEMP_DIR, exist_ok=True)
-
     # ── Process alerts in parallel ───────────────────────────────────────────
     def _worker(alert_data: AlertData) -> bool:
         """Worker function for p_tqdm. Only needs S3 (no MongoDB)."""
@@ -607,10 +892,8 @@ def main():
             return False
 
     if total == 1:
-        # Single alert: run directly (no multiprocessing overhead)
         results = [_worker(alert_data_list[0])]
     else:
-        # Parallel processing with progress bar
         results = p_tqdm.p_map(
             _worker,
             alert_data_list,
