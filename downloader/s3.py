@@ -10,10 +10,11 @@ Handles:
   - Uploading annotated videos to S3
 """
 
+import json
 import os
 import re
 import subprocess
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -35,6 +36,34 @@ class S3Handler:
         except Exception as e:
             logger.warning(f"S3 access error checking {s3_path}: {e}")
             return False
+
+    def _s3_list_keys(self, s3_prefix: str) -> List[str]:
+        """
+        List objects under an S3 prefix using `aws s3 ls --recursive`.
+        Returns list of relative key suffixes (everything after the prefix).
+        """
+        # Ensure prefix ends with /
+        if not s3_prefix.endswith("/"):
+            s3_prefix += "/"
+        try:
+            result = subprocess.run(
+                ["aws", "s3", "ls", s3_prefix, "--recursive"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                return []
+            keys = []
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 4:
+                    keys.append(parts[-1])
+            return keys
+        except Exception as e:
+            logger.warning(f"S3 list error for {s3_prefix}: {e}")
+            return []
 
     def download_file(self, s3_path: str, local_path: str, alert_id: int = None) -> bool:
         """Download a file from S3 using `aws s3 cp`."""
@@ -90,6 +119,103 @@ class S3Handler:
         "fleetdata-production": "fleetdata-protected-production",
     }
 
+    # Video filenames to look for when scanning subdirectories
+    _DMS_VIDEO_NAMES = {"8.mp4", "8_transcoded.mp4", "dmsVideo.mp4"}
+
+    def _resolve_subfolder_video(
+        self, video_s3_path: str, alert_id: int = None,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Handle SQP subfolder layout where 8.mp4 lives in a numbered
+        subdirectory (e.g., s3://bucket/prefix/0/8.mp4 instead of
+        s3://bucket/prefix/8.mp4).
+
+        Lists files under the prefix and searches for DMS video files
+        in any subdirectory.  Also checks for trimmed_video_params.json
+        in the same subfolder to determine the trim start offset.
+
+        Returns (resolved_s3_path, trim_start_ms) if found, else None.
+        """
+        tag = f"[{alert_id}] " if alert_id else ""
+
+        # Parse video_s3_path: s3://bucket/prefix/8.mp4  ->  prefix = "bucket/prefix/"
+        # Remove s3:// and split
+        without_scheme = video_s3_path[len("s3://"):]
+        bucket = without_scheme.split("/")[0]
+        key = "/".join(without_scheme.split("/")[1:])
+        # prefix_dir is everything up to the filename
+        prefix_dir = key[: key.rfind("/") + 1]  # e.g. "N406.../uuid/"
+
+        s3_prefix = f"s3://{bucket}/{prefix_dir}"
+        keys = self._s3_list_keys(s3_prefix)
+        if not keys:
+            return None
+
+        # Look for DMS video files in listed keys
+        resolved = None
+        subfolder = None
+        for listed_key in keys:
+            filename = listed_key.split("/")[-1]
+            if filename in self._DMS_VIDEO_NAMES:
+                resolved = f"s3://{bucket}/{listed_key}"
+                # Extract subfolder (e.g., "0" from "prefix/0/8.mp4")
+                rel_path = listed_key[len(prefix_dir):]  # "0/8.mp4"
+                parts = rel_path.split("/")
+                if len(parts) > 1:
+                    subfolder = parts[0]
+                break
+
+        if resolved is None:
+            return None
+
+        # Check for trimmed_video_params.json in the subfolder
+        trim_start_ms = 0.0
+        if subfolder is not None:
+            trim_params_key = f"{prefix_dir}{subfolder}/trimmed_video_params.json"
+            if trim_params_key in keys:
+                trim_start_ms = self._get_trim_start_from_params(
+                    bucket, trim_params_key, tag,
+                )
+
+        logger.info(
+            f"{tag}Strategy 0b (subfolder search): found {resolved}"
+            + (f" (trim_start={trim_start_ms:.0f}ms)" if trim_start_ms > 0 else "")
+        )
+        return resolved, trim_start_ms
+
+    def _get_trim_start_from_params(
+        self, bucket: str, params_key: str, tag: str = "",
+    ) -> float:
+        """
+        Download and parse trimmed_video_params.json to get the trim
+        start offset for camera 8.
+
+        Returns trim_start_ms (float), or 0.0 if not determinable.
+        """
+        s3_path = f"s3://{bucket}/{params_key}"
+        try:
+            result = subprocess.run(
+                ["aws", "s3", "cp", s3_path, "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return 0.0
+            data = json.loads(result.stdout)
+            params = data.get("trimmed_video_params", {})
+            # Look for camera 8 trim info
+            cam8 = params.get("8", {})
+            start_offset = cam8.get("start_offset")
+            if start_offset is not None:
+                logger.debug(
+                    f"{tag}trimmed_video_params camera 8: "
+                    f"start={start_offset}, end={cam8.get('end_offset')}"
+                )
+                return float(start_offset)
+            return 0.0
+        except Exception as e:
+            logger.warning(f"{tag}Failed to read trimmed_video_params: {e}")
+            return 0.0
+
     def resolve_video_path(
         self, video_s3_path: str, video_http_path: str = None,
         alert_id: int = None,
@@ -114,6 +240,13 @@ class S3Handler:
         if video_s3_path and self.s3_object_exists(video_s3_path):
             logger.info(f"Video found at direct path: {video_s3_path}")
             return video_s3_path, 0.0
+
+        # Strategy 0b: Subfolder search for nd-training-data-production
+        # (SQP layout: 8.mp4 lives in a numbered subdirectory like 0/8.mp4)
+        if video_s3_path:
+            result = self._resolve_subfolder_video(video_s3_path, alert_id)
+            if result:
+                return result  # (s3_path, trim_start_ms)
 
         if not video_http_path:
             return None, 0.0

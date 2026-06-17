@@ -42,7 +42,7 @@ from .data_sources.base import AlertData
 from .data_sources.avid_csv import (
     AvidData, parse_avid_csv, query_avc_api, download_dms_video,
 )
-from .data_sources.mongodb import MongoDBSource
+from .data_sources.alert_id import AlertIdSource
 from .downloader.s3 import S3Handler
 from .metadata.parser import MetadataParser
 from .video.assembler import VideoAssembler
@@ -851,7 +851,7 @@ def _run_alert_flow(args, parser, annotator_names, s3_upload):
 
     # ── Fetch alert data from MongoDB (batch query) ────────────────────────
     logger.info(f"Fetching alert data from MongoDB for {len(alert_ids)} alert(s)...")
-    data_source = MongoDBSource(uri=credentials["mongo_uri"])
+    data_source = AlertIdSource(uri=credentials["mongo_uri"])
     results_map = data_source.fetch_batch(alert_ids)
     data_source.close()
 
