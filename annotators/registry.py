@@ -19,6 +19,7 @@ from .head_pose import HeadPoseAnnotator
 from .event_window import EventWindowAnnotator
 from .frame_info import FrameInfoAnnotator
 from .mouth import MouthKeypointsAnnotator
+from .variance_graphs import MouthYDistVarianceAnnotator, NoseXRatioVarianceAnnotator
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
@@ -42,6 +43,8 @@ _register(HeadPoseAnnotator)
 _register(EventWindowAnnotator)
 _register(FrameInfoAnnotator)
 _register(MouthKeypointsAnnotator)
+_register(MouthYDistVarianceAnnotator)
+_register(NoseXRatioVarianceAnnotator)
 
 
 class AnnotatorRegistry:

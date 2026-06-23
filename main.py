@@ -250,6 +250,7 @@ def process_alert(
                         total_frames=num_frames,
                         event_start_frame=event_start_frame,
                         event_end_frame=event_end_frame,
+                        detections=detections,
                     )
                 img.save(frame_path)
         except Exception as e:
@@ -456,6 +457,7 @@ def process_avid(
                             total_frames=num_frames,
                             event_start_frame=event_start_frame,
                             event_end_frame=event_end_frame,
+                            detections=detections,
                         )
                     img.save(frame_path)
             except Exception as e:
@@ -467,7 +469,7 @@ def process_avid(
     if avid_data.has_event_code:
         parts.append(avid_data.event_code)
     if avid_data.should_clip:
-        parts.append(f"{event_start_frame}_{event_end_frame}")
+        parts.append(f"{avid_data.start_offset}_{avid_data.end_offset}")
     video_name = "_".join(parts) + ".mp4"
 
     output_video = os.path.join(output_dir, video_name)
@@ -585,6 +587,9 @@ Examples:
 
   # List available annotation types
   python -m video_annotator.main --list-annotators
+
+  # run a sample
+  python -m video_annotator.main --avids --csv sample_avids.csv --annotate all --sample 10
 """,
     )
 
@@ -689,6 +694,14 @@ Examples:
             "prompted to enter the path interactively."
         ),
     )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help=(
+            "Number of sample videos to process (default: 10)."
+        ),
+    )
 
     return parser
 
@@ -721,6 +734,7 @@ def main():
 
     # Always log to temp/video_annotator.log
     os.makedirs(TEMP_DIR, exist_ok=True)
+    os.system(f"sudo rm -rf {TEMP_DIR}/*") # Clear temp dir to avoid clutter
     log_dest = args.log_file or LOG_FILE
     logger.add(log_dest, level="DEBUG", mode="w")
     logger.info(f"Log file: {log_dest}")
@@ -764,12 +778,12 @@ def main():
 
     # ── Branch: AVID vs Alert flow ──────────────────────────────────────────
     if args.avids:
-        _run_avid_flow(args, annotator_names, s3_upload)
+        _run_avid_flow(args, annotator_names, s3_upload, args.sample)
     else:
-        _run_alert_flow(args, parser, annotator_names, s3_upload)
+        _run_alert_flow(args, parser, annotator_names, s3_upload, args.sample)
 
 
-def _run_avid_flow(args, annotator_names, s3_upload):
+def _run_avid_flow(args, annotator_names, s3_upload, sample=None):
     """Process AVIDs from CSV: AVC API -> S3 download -> annotate/convert."""
     avid_data_list = parse_avid_csv(args.csv)
     if not avid_data_list:
@@ -799,13 +813,13 @@ def _run_avid_flow(args, annotator_names, s3_upload):
         except Exception as e:
             logger.error(f"Unhandled error for avid {avid_data.avid}: {e}")
             return False
-
+    data_to_process = avid_data_list[:sample] if sample is not None else avid_data_list
     if total == 1:
         results = [_worker(avid_data_list[0])]
     else:
         results = p_tqdm.p_map(
             _worker,
-            avid_data_list,
+            data_to_process,
             num_cpus=num_workers,
             desc="Processing AVIDs",
         )
@@ -817,7 +831,7 @@ def _run_avid_flow(args, annotator_names, s3_upload):
     logger.info(f"{'='*60}")
 
 
-def _run_alert_flow(args, parser, annotator_names, s3_upload):
+def _run_alert_flow(args, parser, annotator_names, s3_upload, sample=None):
     """Process alert IDs from CSV or --alert-id: MongoDB -> S3 download -> annotate."""
     # ── Load database credentials ──────────────────────────────────────────
     creds_path = args.credentials_file
@@ -890,13 +904,13 @@ def _run_alert_flow(args, parser, annotator_names, s3_upload):
         except Exception as e:
             logger.error(f"Unhandled error for alert {alert_data.alert_id}: {e}")
             return False
-
+    data_to_process = alert_data_list[:args.sample] if args.sample is not None else alert_data_list
     if total == 1:
         results = [_worker(alert_data_list[0])]
     else:
         results = p_tqdm.p_map(
             _worker,
-            alert_data_list,
+            data_to_process,
             num_cpus=num_workers,
             desc="Annotating videos",
         )

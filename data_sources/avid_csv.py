@@ -260,13 +260,21 @@ def parse_avid_csv(csv_path: str) -> List[AvidData]:
                 event_code = str(val).strip()
 
         start_offset = None
-        if "start_offset" in df.columns:
+        if "st_fidx" in df.columns:
+            val = row.get("st_fidx")
+            if pd.notna(val):
+                start_offset = int(val)*100  # convert from frames to ms (assuming 10 fps)
+        elif "start_offset" in df.columns:
             val = row.get("start_offset")
             if pd.notna(val):
                 start_offset = int(val)
 
         end_offset = None
-        if "end_offset" in df.columns:
+        if "et_fidx" in df.columns:
+            val = row.get("et_fidx")
+            if pd.notna(val):
+                end_offset = int(val)*100  # convert from frames to ms (assuming 10 fps)
+        elif "end_offset" in df.columns:
             val = row.get("end_offset")
             if pd.notna(val):
                 end_offset = int(val)

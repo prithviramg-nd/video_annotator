@@ -79,6 +79,8 @@ COLORS = {
     "head_pose": "yellow",
     "eye_scores_left": "red",
     "eye_scores_right": "orange",
+    "mouth_ydist_var": (255, 165, 0),   # orange - mouth y-dist variance graph
+    "nose_x_var": (0, 255, 200),        # teal - nose x ratio variance graph
 }
 
 # ── Eye state names ─────────────────────────────────────────────────────────

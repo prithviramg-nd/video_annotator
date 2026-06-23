@@ -39,3 +39,15 @@ class MouthKeypointsAnnotator(BaseAnnotator):
                 fill="white",
                 font=font,
             )
+            draw.text(
+                (pts[2][0] + 15, pts[2][1] + 15),
+                f"V: {v_dist:.3f}",
+                fill="white",
+                font=font,
+            )
+            draw.text(
+                (pts[2][0] + 15, pts[2][1] + 30),
+                f"H: {h_dist:.3f}",
+                fill="white",
+                font=font,
+            )
