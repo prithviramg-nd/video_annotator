@@ -54,20 +54,6 @@ class MouthYDistVarianceAnnotator(BaseAnnotator):
 
         return y_dists, variances
 
-    def _is_mouth_obstructed(self, detection, g_top, g_bottom):
-        """Check if mouth keypoints fall within the graph region."""
-        mouth_kps = detection.get("mouth_kps") if detection else None
-        if mouth_kps is None or len(mouth_kps) < 8:
-            return False
-        # mouth_kps is a flat list: [x0,y0, x1,y1, x2,y2, x3,y3, ...]
-        for i in range(0, len(mouth_kps), 2):
-            kp_x = mouth_kps[i]
-            kp_y = mouth_kps[i + 1] if i + 1 < len(mouth_kps) else None
-            if kp_y is not None:
-                if g_top <= kp_y <= g_bottom:
-                    return True
-        return False
-
     def annotate(self, img, draw, detection, frame_idx, total_frames, **kwargs):
         detections = kwargs.get("detections")
         if detections is None:
@@ -92,10 +78,11 @@ class MouthYDistVarianceAnnotator(BaseAnnotator):
         g_left = 10
         g_right = img.width // 2 - 10
 
-        # If mouth keypoints are obstructed by the graph, move graph to 30% from top
-        if self._is_mouth_obstructed(detection, g_top - 20, g_bottom):
-            g_top = int(img.height * 0.30)
-            g_bottom = g_top + g_height
+        # If mouth keypoints are obstructed by the graph, move graph to 20% from top
+        if detection is not None and detection.get("mouth_kps") is not None:
+            if detection["mouth_kps"][3] > img.height * 0.65: # then mouth is low in frame, move graph up
+                g_top = int(img.height * 0.20)
+                g_bottom = g_top + g_height
 
         font = self.get_small_font()
         color = COLORS.get("mouth_ydist_var", (255, 165, 0))  # orange
@@ -223,16 +210,6 @@ class NoseXRatioVarianceAnnotator(BaseAnnotator):
 
         return ratios, variances
 
-    def _is_nose_obstructed(self, detection, g_top, g_bottom):
-        """Check if nose keypoints fall within the graph region."""
-        nose = detection.get("nose") if detection else None
-        if nose is None:
-            return False
-        nose_x, nose_y = nose[0], nose[1]
-        if g_top <= nose_y <= g_bottom:
-            return True
-        return False
-
     def annotate(self, img, draw, detection, frame_idx, total_frames, **kwargs):
         detections = kwargs.get("detections")
         if detections is None:
@@ -257,10 +234,11 @@ class NoseXRatioVarianceAnnotator(BaseAnnotator):
         g_left = img.width // 2 + 10
         g_right = img.width - 10
 
-        # If nose keypoints are obstructed by the graph, move graph to 30% from top
-        if self._is_nose_obstructed(detection, g_top - 20, g_bottom):
-            g_top = int(img.height * 0.30)
-            g_bottom = g_top + g_height
+        # If nose keypoints are obstructed by the graph, move graph to 20% from top
+        if detection is not None and detection.get("nose") is not None:
+            if detection["nose"][1] > img.height * 0.65: # then face is low in frame, move graph up
+                g_top = int(img.height * 0.20)
+                g_bottom = g_top + g_height
 
         font = self.get_small_font()
         color = COLORS.get("nose_x_var", (0, 255, 200))  # teal/green
