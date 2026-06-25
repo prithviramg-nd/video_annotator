@@ -78,9 +78,9 @@ class MouthYDistVarianceAnnotator(BaseAnnotator):
         g_left = 10
         g_right = img.width // 2 - 10
 
-        # If mouth keypoints are obstructed by the graph, move graph to 20% from top
-        if detection is not None and detection.get("mouth_kps") is not None:
-            if detection["mouth_kps"][3] > img.height * 0.65: # then mouth is low in frame, move graph up
+        # If nose keypoints are obstructed by the graph, move graph to 20% from top
+        if detection is not None and detection.get("nose") is not None:
+            if detection["nose"][1] > img.height * 0.70: # then mouth is low in frame, move graph up
                 g_top = int(img.height * 0.20)
                 g_bottom = g_top + g_height
 
@@ -236,7 +236,7 @@ class NoseXRatioVarianceAnnotator(BaseAnnotator):
 
         # If nose keypoints are obstructed by the graph, move graph to 20% from top
         if detection is not None and detection.get("nose") is not None:
-            if detection["nose"][1] > img.height * 0.65: # then face is low in frame, move graph up
+            if detection["nose"][1] > img.height * 0.70: # then face is low in frame, move graph up
                 g_top = int(img.height * 0.20)
                 g_bottom = g_top + g_height
 
